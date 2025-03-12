@@ -1,4 +1,5 @@
 import os,sys,inspect
+import pandas as pd
 script_dirname = os.path.dirname(os.path.abspath(__file__))
 from tqdm import tqdm
 import shutil
@@ -9,12 +10,13 @@ import torch.nn as nn
 import time
 import shutil
 import json
-import wandb
+#import wandb
 import argparse
 from audio_utils import SpecViewer, WhisperSegFeatureExtractor
 from utils import *
 from model import *
 from datautils import *
+from preproc_dset import convert_their_df_to_ours
 from evaluate import evaluate
 import subprocess
 import json
@@ -24,35 +26,32 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 def train_iteration(batch):
     for key in batch:
         batch[key] = batch[key].to(device)
-    
+
     optimizer.zero_grad()
-    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):   
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         model_out = model( **batch )
         loss = model_out.loss.mean()
     scaler.scale(loss).backward()
     scaler.step(optimizer)
     # optimizer.step()
     scaler.update()
-    
-    """ 
+
+    """
     # normal version without float16 speedup
     optimizer.zero_grad()
     model_out = model( **batch )
     loss = model_out.loss.mean()
-    loss.backward()    
+    loss.backward()
     optimizer.step()
     """
     return loss.item()
 
-
-
 if __name__ == "__main__":
-    
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--initial_model_path" )
     parser.add_argument("--model_folder" )
-    parser.add_argument("--train_dataset_folder" )
+    parser.add_argument("--dset", '-d', required=True)
     parser.add_argument("--n_device", type = int, default = 1 )
     parser.add_argument("--gpu_list", type = int, nargs = "+", default = None )
     parser.add_argument("--use_wandb", type = int, default = 0 )
@@ -65,9 +64,9 @@ if __name__ == "__main__":
     parser.add_argument("--save_per_epoch", type = int, default = 0 )
     parser.add_argument("--max_num_epochs", type = int, default = 3 )
     parser.add_argument("--max_num_iterations", type = int, default = None )
-    parser.add_argument("--min_num_iterations", type = int, default = 500 )
+    parser.add_argument("--min_num_iterations", type = int, default = 100 )
     parser.add_argument("--val_ratio", type = float, default = 0.0 )
-    
+
     parser.add_argument("--max_length", type = int, default = 100 )
     parser.add_argument("--total_spec_columns", type = int, default = 1000 )
     parser.add_argument("--batch_size", type = int, default = 4 )
@@ -80,24 +79,11 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_encoder", type = int, default = 0 )
     parser.add_argument("--dropout", type = float, default = 0.0 )
     parser.add_argument("--num_workers", type = int, default = 4 )
-    
+
     parser.add_argument("--clear_cluster_codebook", type = int, help="set the pretrained model's cluster_codebook to empty dict. This is used when we train the segmenter on a complete new dataset. Set this to 0 if you just want to slighlt finetune the model with some additional data with the same cluster naming rule.", default = 1 )
-    
+
     args = parser.parse_args()
 
-    if args.use_wandb:
-        wandb.init( project = args.project, name = args.run_name )
-        wandb.define_metric("current_step")
-        wandb.define_metric( "epoch", step_metric="current_step")
-        wandb.define_metric( "train/loss", step_metric="current_step")
-        wandb.define_metric( "train/learning_rate", step_metric="current_step")
-        wandb.define_metric( "validate/score", step_metric="current_step")
-        wandb.define_metric( "validate/segment_score", step_metric="current_step")
-        wandb.define_metric( "validate/frame_score", step_metric="current_step")
-
-    if args.seed is not None:
-        np.random.seed(args.seed)  
-        
     if args.val_ratio == 0.0:
         args.validate_every = None
         args.validate_per_epoch= None
@@ -106,27 +92,27 @@ if __name__ == "__main__":
 
     if args.gpu_list is None:
         args.gpu_list = np.arange(args.n_device).tolist()
-        
+
     device = torch.device(  "cuda:%d"%( args.gpu_list[0] ) if torch.cuda.is_available() else "cpu" )
 
     model, tokenizer = load_model( args.initial_model_path, args.total_spec_columns, args.dropout)
 
     model = model.to(device)
-    
+
     if args.freeze_encoder:
         for para in model.model.encoder.parameters():
             para.requires_grad = False
     else:
         for para in model.model.encoder.parameters():
             para.requires_grad = True
-            
+
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr = args.learning_rate )
-    
+
     model = nn.DataParallel( model, args.gpu_list )
 
     segmenter = WhisperSegmenterForEval( model = model, tokenizer = tokenizer )
@@ -136,16 +122,17 @@ if __name__ == "__main__":
 
     scaler = torch.cuda.amp.GradScaler()
 
-    audio_path_list_train, label_path_list_train = get_audio_and_label_paths( args.train_dataset_folder ) 
+    train_dset_dir = f'data/ours/{args.dset}/train'
+    audio_path_list_train, label_path_list_train = get_audio_and_label_paths(train_dset_dir)
 
     default_config = determine_default_config(audio_path_list_train, label_path_list_train, args.total_spec_columns)
     ## store the default segmentation config
     segmenter.model.config.default_segmentation_config = default_config
     segmenter.default_segmentation_config = default_config
-    
+
     cluster_codebook = get_cluster_codebook( label_path_list_train, segmenter.cluster_codebook )
     segmenter.update_cluster_codebook( cluster_codebook )
-    
+
     audio_list_train, label_list_train = load_data(audio_path_list_train, label_path_list_train, cluster_codebook = cluster_codebook, n_threads = 20, default_config = default_config )
 
     if args.val_ratio > 0:
@@ -153,21 +140,21 @@ if __name__ == "__main__":
 
     audio_list_train, label_list_train = slice_audios_and_labels( audio_list_train, label_list_train, args.total_spec_columns )
 
-    training_dataset = VocalSegDataset( audio_list_train, label_list_train, tokenizer, args.max_length, 
+    training_dataset = VocalSegDataset( audio_list_train, label_list_train, tokenizer, args.max_length,
                                          args.total_spec_columns, model.module.config.species_codebook  )
 
-    training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size , shuffle = True , 
-                                             worker_init_fn = lambda x:[np.random.seed( epoch  + x ),  
-                                                                    torch.manual_seed( epoch + x) ], 
-                                             num_workers = args.num_workers, 
-                                             drop_last= True, 
+    training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size , shuffle = True ,
+                                             worker_init_fn = lambda x:[np.random.seed( epoch  + x ),
+                                                                    torch.manual_seed( epoch + x) ],
+                                             num_workers = args.num_workers,
+                                             drop_last= True,
                                              pin_memory = False
                                            )
     if len(training_dataloader) == 0:
-        training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size , shuffle = True , 
-                                             worker_init_fn = lambda x:[np.random.seed( epoch  + x ),  
-                                                                    torch.manual_seed( epoch + x) ], 
-                                             num_workers = args.num_workers, 
+        training_dataloader = DataLoader( training_dataset, batch_size = args.batch_size , shuffle = True ,
+                                             worker_init_fn = lambda x:[np.random.seed( epoch  + x ),
+                                                                    torch.manual_seed( epoch + x) ],
+                                             num_workers = args.num_workers,
                                              drop_last= False,  ## set drop_last to False to fully utilize small dataset
                                              pin_memory = False
                                            )
@@ -175,26 +162,26 @@ if __name__ == "__main__":
     if len(training_dataloader) == 0:
         print("Error: Too few examples (less than a batch) for training! Exit!")
         sys.exit(1)
-    
-    if args.max_num_iterations is not None and args.max_num_iterations > 0:            
+
+    if args.max_num_iterations is not None and args.max_num_iterations > 0:
         args.max_num_epochs = int(np.ceil( args.max_num_iterations / len( training_dataloader )  ))
     else:
         assert args.max_num_epochs is not None and args.max_num_epochs > 0
         args.max_num_iterations = len( training_dataloader ) * args.max_num_epochs
-        
+
         if args.min_num_iterations is not None:
             args.max_num_iterations = max( args.max_num_iterations, args.min_num_iterations )
             args.max_num_epochs = int(np.ceil( args.max_num_iterations / len( training_dataloader )  ))
-                
+
     if args.lr_schedule == "linear":
         scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps= args.warmup_steps, 
+            optimizer, num_warmup_steps= args.warmup_steps,
             num_training_steps = args.max_num_iterations
         )
     else:
         scheduler = None
-        
-    model.train() 
+
+    model.train()
     training_loss_value_list = []
     val_score_history = []
     eary_stop = False
@@ -203,14 +190,14 @@ if __name__ == "__main__":
     progress = 0
     eta = None
     start_time = time.time()
-    
+
     for epoch in range(args.max_num_epochs + 1):  # This +1 is to ensure current_step can reach args.max_num_iterations
         for count, batch in enumerate( tqdm( training_dataloader ) ):
             training_loss_value_list.append( train_iteration(batch) )
-            
+
             if scheduler is not None:
                 scheduler.step()
-                
+
             current_step += 1
 
             current_time = time.time()
@@ -225,20 +212,10 @@ if __name__ == "__main__":
                            }, open( args.model_folder + "/status.json", "w" ) )
             progress = current_progress
 
-            
+
             if current_step % args.print_every == 0:
                 print("Epoch: %d, current_step: %d, learning rate: %f, Loss: %.4f"%( epoch, current_step, get_lr(optimizer)[0], np.mean(training_loss_value_list)) )
-                if args.use_wandb:
-                    wandb.log(
-                        {
-                            "current_step":current_step,
-                            "train/learning_rate":get_lr(optimizer)[0],
-                            "train/loss":np.mean(training_loss_value_list),
-                            "epoch": epoch + count / len(training_dataloader)
-                        }
-                    )
-                
-                training_loss_value_list = [] 
+                training_loss_value_list = []
 
             if ( args.validate_every is not None and current_step % args.validate_every == 0 ) or \
                 ( args.validate_per_epoch and count == len(training_dataloader) - 1 ):
@@ -246,22 +223,13 @@ if __name__ == "__main__":
                 model.eval()
                 ## in the validation set, set the num_trails to 1
                 eval_res = evaluate( audio_list_val, label_list_val, segmenter, args.batch_size, args.max_length, num_trials =1, num_beams=1, target_cluster = None )
-         
-                print("Epoch: %d, current_step: %d, validation segment F1 score: %.2f, frame F1 score: %.2f"%( epoch, current_step, 
+
+                print("Epoch: %d, current_step: %d, validation segment F1 score: %.2f, frame F1 score: %.2f"%( epoch, current_step,
                                                                       eval_res["segment_wise"][-1], eval_res["frame_wise"][-1] ))
-                if args.use_wandb:
-                    wandb.log(
-                        {
-                            "current_step":current_step,
-                            "validate/score": ( eval_res["segment_wise"][-1] + eval_res["frame_wise"][-1] ) * 0.5,
-                            "validate/segment_score": eval_res["segment_wise"][-1],
-                            "validate/frame_score": eval_res["frame_wise"][-1]
-                        }
-                    )    
                 val_score_history.append( ( current_step, ( eval_res["segment_wise"][-1] + eval_res["frame_wise"][-1] ) * 0.5 ) )
-                
+
                 model.train()
-            
+
             if ( args.save_every is not None and current_step % args.save_every == 0 ) or \
                ( args.save_per_epoch and count == len(training_dataloader) - 1 ):
                 model.eval()
@@ -274,7 +242,7 @@ if __name__ == "__main__":
                    val_score_history[-1][1] < val_score_history[-2][1] and \
                    val_score_history[-2][1] < val_score_history[-3][1]:
                     eary_stop = True
-            
+
             if current_step >= args.max_num_iterations or eary_stop :
                 if not os.path.exists( args.model_folder+"/checkpoint-%d"%(current_step) ):
                     model.eval()
@@ -282,7 +250,7 @@ if __name__ == "__main__":
                 break
 
         if current_step >= args.max_num_iterations or eary_stop :
-            break   
+            break
 
     json.dump( { "progress":100,
                  "eta": "%02d:%02d:%02d"%( 0, 0, 0 )
@@ -297,7 +265,7 @@ if __name__ == "__main__":
             ckpt_list.sort( key = os.path.getmtime )
             ckpt_name = ckpt_list[-1]
             best_checkpoint_batch_number = int(ckpt_name.split("-")[-1])
-        
+
 
     if best_checkpoint_batch_number is not None:
         print("The best checkpoint on validation set is: %s," % ( args.model_folder+"/checkpoint-%d"%(best_checkpoint_batch_number) ) )
@@ -307,16 +275,52 @@ if __name__ == "__main__":
 
         hf_model_folder = args.model_folder+"/final_checkpoint"
         ct2_model_folder = hf_model_folder + "_ct2"
-        
-        subprocess.run([ "python", os.path.join( script_dirname, "convert_hf_to_ct2.py" ), 
-                         "--model", hf_model_folder,
-                         "--output_dir", ct2_model_folder,
-                         "--quantization", "int8_float16"
-                       ])
+
+        #subprocess.run([ "python", os.path.join( script_dirname, "convert_hf_to_ct2.py" ),
+        #                 "--model", hf_model_folder,
+        #                 "--output_dir", ct2_model_folder,
+        #                 "--quantization", "int8_float16"
+        #               ])
     try:
         os.remove( args.model_folder + "/status.json" )
     except:
         pass
-    
-    print("All Done!")    
 
+
+    if args.val_ratio > 0:
+        eval_res = evaluate( audio_list_val, label_list_val, segmenter, args.batch_size, args.max_length, num_trials =1, num_beams=1, target_cluster = None )
+    fns = [];
+    test_dset_dir = f'data/ours/{args.dset}/test'
+    audio_path_list_test, label_path_list_test = get_audio_and_label_paths(test_dset_dir)
+    audio_list_test, label_list_test = load_data(audio_path_list_test, label_path_list_test, cluster_codebook = cluster_codebook, n_threads = 20, default_config = default_config )
+    fns = []; fpfps = []
+    os.makedirs(f'outputs/{args.dset}', exist_ok=True)
+    for audio, label, audio_fp in tqdm(zip(audio_list_test, label_list_test, audio_path_list_test), total = len(audio_list_test)):
+        try:
+            prediction = segmenter.segment(  audio, sr = label["sr"],
+                       min_frequency = label.get("min_frequency", None),
+                       spec_time_step = label.get("spec_time_step", None),
+
+                       max_length = args.max_length,
+                       batch_size = args.batch_size,
+                       num_trials = 1,
+                       num_beams = 1
+                 )
+        except ValueError:
+            prediction = None
+        reformatted_pred = convert_their_df_to_ours(pd.DataFrame(prediction))
+        fn = os.path.basename(audio_fp).replace('.wav', '')
+        fns.append(fn)
+        reformatted_pred.to_csv(pred_fp:=f'outputs/{args.dset}/{fn}.txt', sep='\t')
+        fpfps.append(pred_fp)
+    if args.dset=='powdermill':
+        annotations_fp = [f'../vb3/datasets/{args.dset}/formatted/selection_tables/{x}.Table.1.selections.txt' for x in fns]
+    elif args.dset=='hawaii':
+        annotations_fp = [f'../vb3/datasets/{args.dset}/formatted/selection_tables/selection_table_{x}.txt' for x in fns]
+    else:
+        annotations_fp = [f'../vb3/datasets/{args.dset}/formatted/selection_tables/{x}.txt' for x in fns]
+    manifest = pd.DataFrame({'filename' : fns, 'fwd_predictions_fp' : fpfps, 'bck_predictions_fp' : None, 'annotations_fp' : annotations_fp, 'duration_sec' : 100})
+    assert all(os.path.exists(x) for x in manifest.annotations_fp.values)
+    manifest.to_csv(f'outputs/{args.dset}/manifest.txt', sep='\t')
+
+    print("All Done!")
